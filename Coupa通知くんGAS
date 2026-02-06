@@ -1,0 +1,177 @@
+/**
+ * ==============================================================================
+ * 【設定エリア】 ★ここを自分の内容に書き換えてください★
+ * ==============================================================================
+ */
+const CONFIG = {
+  // 1. 通知先（Google Chat ウェブフック）
+  CHAT_WEBHOOK_URL: "★自分のウェブフックURL★",
+     
+  // 2. スプレッドシート設定
+  SHEET_ID: "★自分のスプレッドシートID★",
+  SHEET_NAME: "担当案件",
+   
+  // 3. 自分宛のSACCSメールを判別するためのラベル名
+  SACCS_MY_FILTER_LABEL: "★SACCS_自分のイニシャル★",
+     
+  // 4. Gmailの検索設定（未読メールを対象にします）
+  LABELS: {
+    COUPA: 'label:coupa_all is:unread',
+    SACCS: 'label:SACCS_all is:unread',
+    ML:    'label:to_ML is:unread'
+  }
+};
+ 
+/**
+ * ==============================================================================
+ * 【システムエリア】 ここから下は原則変更不要です（2026-02-05更新）
+ * ==============================================================================
+ */
+ 
+const INTERNAL_LABELS = {
+  COUPA_DONE: "coupa_assigned"
+};
+ 
+function checkAllSystemEmails() {
+  const ss = SpreadsheetApp.openById(CONFIG.SHEET_ID);
+  const sheet = ss.getSheetByName(CONFIG.SHEET_NAME);
+  const lastRow = sheet.getLastRow();
+ 
+  let keywords = [];
+  if (lastRow >= 2) {
+    const data = sheet.getRange(2, 1, lastRow - 1, 2).getValues();
+    keywords = data
+      .filter(row => String(row[0]).trim() !== "")
+      .map(row => String(row[0]).trim());
+  }
+ 
+  const labelCoupa =
+    GmailApp.getUserLabelByName(INTERNAL_LABELS.COUPA_DONE) ||
+    GmailApp.createLabel(INTERNAL_LABELS.COUPA_DONE);
+ 
+  processEmails(CONFIG.LABELS.COUPA, keywords, labelCoupa, "Coupa");
+  processEmails(CONFIG.LABELS.SACCS, [], null, "SACCS");
+  processEmails(CONFIG.LABELS.ML, keywords, labelCoupa, "ML宛案件");
+}
+ 
+function processEmails(query, keywords, targetLabel, systemName) {
+  // 取得漏れ防止のため上限を30件に設定
+  const threads = GmailApp.search(query, 0, 30);
+ 
+  threads.forEach(thread => {
+    const messages = thread.getMessages();
+ 
+    messages.forEach(message => {
+      if (!message.isUnread()) return;
+ 
+      const subject = message.getSubject();
+      const dateStr = Utilities.formatDate(message.getDate(), "JST", "yyyy/MM/dd HH:mm");
+      const gmailLink = thread.getPermalink();
+ 
+      let taskActionLink = "";
+      let extractedId = "";
+      let shouldNotify = false;
+ 
+      if (systemName === "Coupa") {
+        // ===== Coupa: プレーン本文に無いURL（HTML/urldefense）も拾う =====
+        const plain = message.getPlainBody() || "";
+        const html = message.getBody() || "";
+ 
+        const normalize = (s) => String(s)
+          .replace(/=\r?\n/g, "")   // quoted-printable折り返し
+          .replace(/\r?\n/g, " ");  // 改行潰し
+ 
+        const haystack = normalize(plain + "\n" + html);
+ 
+        // 通常URL / urldefense の両対応（1行完結で貼り付け事故防止）
+        const reNormal = /https?:\/\/lycorp-jp\.coupahost\.com\/quotes\/requests\/(\d+)/i;
+        const reDefense = /urldefense\.com\/v3\/__https?:\/\/lycorp-jp\.coupahost\.com\/quotes\/requests\/(\d+)__;/i;
+ 
+        const m = haystack.match(reNormal) || haystack.match(reDefense);
+ 
+        if (m) {
+          extractedId = String(m[1]).trim();
+ 
+          // ID一致（数字のみで比較）
+          shouldNotify = keywords.some(kw => {
+            const cleanKw = String(kw).replace(/[^0-9]/g, "");
+            const cleanExt = extractedId.replace(/[^0-9]/g, "");
+            return (cleanKw !== "" && cleanKw === cleanExt);
+          });
+ 
+          // action linkは固定URL（urldefense外側は使わない）
+          taskActionLink = "https://lycorp-jp.coupahost.com/quotes/requests/" + extractedId;
+        }
+ 
+      } else if (systemName === "SACCS") {
+        const body = message.getPlainBody() || "";
+        const currentLabels = thread.getLabels().map(l => l.getName());
+ 
+        if (currentLabels.includes(CONFIG.SACCS_MY_FILTER_LABEL) && !body.includes("/share/")) {
+          const saccsUrlMatch = body.match(/https?:\/\/saccs\.workers-hub\.com\/inspections\/target\/list\/[^\s\n\r<>"]+/);
+          if (saccsUrlMatch) {
+            shouldNotify = true;
+            extractedId = "SACCS完了";
+            taskActionLink = saccsUrlMatch[0];
+          }
+        }
+ 
+      } else if (systemName === "ML宛案件") {
+        const body = message.getPlainBody() || "";
+ 
+        const hashIdMatch = subject.match(/#(\d+)/) || body.match(/#(\d+)/);
+        if (hashIdMatch) {
+          extractedId = String(hashIdMatch[1]).trim();
+          shouldNotify = keywords.some(kw =>
+            String(kw).replace(/[^0-9]/g, "") === extractedId.replace(/[^0-9]/g, "")
+          );
+        } else {
+          shouldNotify = keywords.some(kw => subject.includes(String(kw).trim()));
+        }
+ 
+        taskActionLink = gmailLink;
+      }
+ 
+      if (shouldNotify) {
+        sendToGoogleChat(systemName, subject, gmailLink, extractedId, dateStr);
+        createTodoTask(systemName, subject, extractedId, taskActionLink, dateStr);
+        if (targetLabel) thread.addLabel(targetLabel);
+        message.markRead();
+      } else {
+        // あなたの仕様維持：Coupa/SACCSは通知しないなら既読化
+        if (systemName === "Coupa" || systemName === "SACCS") {
+          message.markRead();
+        }
+      }
+    });
+  });
+}
+ 
+function createTodoTask(systemName, subject, keyword, taskActionLink, dateStr) {
+  try {
+    Tasks.Tasks.insert({
+      title: "【" + systemName + "】ID:" + keyword + " / " + subject,
+      notes: "受信: " + dateStr + "\n🔗 リンク: " + taskActionLink
+    }, "@default");
+  } catch (e) {
+    console.log("ToDo失敗: " + e.message);
+  }
+}
+ 
+function sendToGoogleChat(systemName, subject, gmailLink, keyword, dateStr) {
+  const icon = (systemName === "Coupa") ? "🤑" : (systemName === "SACCS") ? "👿" : "📧";
+  const payload = {
+    text:
+      icon + " *【" + systemName + " 担当案件通知】*\n" +
+      "🔹 *ID:* " + keyword + "\n" +
+      "🔹 *件名:* " + subject + "\n" +
+      "🔹 *受信:* " + dateStr + "\n" +
+      "📥 *Gmail:* " + gmailLink
+  };
+ 
+  UrlFetchApp.fetch(CONFIG.CHAT_WEBHOOK_URL, {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify(payload)
+  });
+}
